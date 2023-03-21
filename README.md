@@ -1,2 +1,2 @@
 # token
-infra.go token module.
+infra.Go token module.
