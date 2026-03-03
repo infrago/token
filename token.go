@@ -24,10 +24,11 @@ var module = &tokenModule{
 	signers: map[string]Signer{},
 	drivers: map[string]Driver{},
 	config: tokenConfig{
-		Signer:  "default",
-		Driver:  "default",
-		Payload: PayloadToken,
-		Setting: Map{},
+		Signer:   "default",
+		Driver:   "default",
+		Payload:  PayloadToken,
+		IDLength: 16,
+		Setting:  Map{},
 	},
 }
 
@@ -66,11 +67,12 @@ type (
 	}
 
 	tokenConfig struct {
-		Signer  string
-		Driver  string
-		Payload string
-		Secret  string
-		Setting Map
+		Signer   string
+		Driver   string
+		Payload  string
+		Secret   string
+		IDLength int
+		Setting  Map
 	}
 
 	tokenModule struct {
@@ -117,6 +119,11 @@ func (m *tokenModule) Config(global Map) {
 	if v, ok := cfg["secret"].(string); ok {
 		m.config.Secret = strings.TrimSpace(v)
 	}
+	if v, ok := parseConfigInt(cfg["idLength"]); ok {
+		m.config.IDLength = v
+	} else if v, ok := parseConfigInt(cfg["idlength"]); ok {
+		m.config.IDLength = v
+	}
 	if v, ok := cfg["setting"].(Map); ok && v != nil {
 		m.config.Setting = v
 	}
@@ -136,6 +143,7 @@ func (m *tokenModule) Setup() {
 		m.driver = m.drivers["default"]
 	}
 	m.config.Payload = normalizePayloadMode(m.config.Payload)
+	m.config.IDLength = normalizeIDLength(m.config.IDLength)
 
 	if c, ok := m.signer.(Configurable); ok {
 		c.Configure(m.config.Setting)
@@ -145,6 +153,9 @@ func (m *tokenModule) Setup() {
 	}
 	if s, ok := m.signer.(interface{ SetSecret(string) }); ok {
 		s.SetSecret(m.config.Secret)
+	}
+	if s, ok := m.signer.(interface{ SetIDLength(int) }); ok {
+		s.SetIDLength(m.config.IDLength)
 	}
 }
 
@@ -183,7 +194,7 @@ func (m *tokenModule) Sign(req infra.Token) (string, error) {
 	origPayload := req.Payload
 	signReq := req
 	if signReq.TokenID == "" {
-		signReq.TokenID = infra.Generate()
+		signReq.TokenID = infra.GenerateTokenID(m.config.IDLength)
 	}
 	if payloadMode == PayloadStore {
 		signReq.Payload = Map{}
@@ -310,8 +321,9 @@ func mergePayload(tokenPayload, storePayload Map) Map {
 }
 
 type defaultSigner struct {
-	secret string
-	codec  string
+	secret   string
+	codec    string
+	idLength int
 }
 
 type defaultHeader struct {
@@ -331,10 +343,14 @@ func (d *defaultSigner) SetSecret(secret string) {
 	d.secret = strings.TrimSpace(secret)
 }
 
+func (d *defaultSigner) SetIDLength(length int) {
+	d.idLength = normalizeIDLength(length)
+}
+
 func (d *defaultSigner) Sign(req infra.Token) (string, error) {
 	tokenID := req.TokenID
-	if tokenID == "" || req.NewID {
-		tokenID = infra.Generate()
+	if tokenID == "" {
+		tokenID = infra.GenerateTokenID(d.idLength)
 	}
 
 	header := defaultHeader{ID: tokenID, Begin: req.Begin, End: req.Expires, Auth: req.Auth}
@@ -582,6 +598,47 @@ func defaultSecret() string {
 		return project
 	}
 	return infra.INFRAGO
+}
+
+func parseConfigInt(v Any) (int, bool) {
+	switch vv := v.(type) {
+	case int:
+		return vv, true
+	case int8:
+		return int(vv), true
+	case int16:
+		return int(vv), true
+	case int32:
+		return int(vv), true
+	case int64:
+		return int(vv), true
+	case uint:
+		return int(vv), true
+	case uint8:
+		return int(vv), true
+	case uint16:
+		return int(vv), true
+	case uint32:
+		return int(vv), true
+	case uint64:
+		return int(vv), true
+	case float32:
+		return int(vv), true
+	case float64:
+		return int(vv), true
+	default:
+		return 0, false
+	}
+}
+
+func normalizeIDLength(length int) int {
+	if length <= 0 {
+		return 16
+	}
+	if length > 128 {
+		return 128
+	}
+	return length
 }
 
 func RegisterSigner(name string, signer Signer) {
