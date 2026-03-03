@@ -28,6 +28,7 @@
 signer = "default"
 driver = "default"
 payload = "token"  # token | store | hybrid
+secret = "token-secret" # 为空时默认使用 infra.Project
 
 [token.setting]
 # signer 和 driver 都可读取本节配置
