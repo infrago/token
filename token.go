@@ -2,22 +2,41 @@ package token
 
 import (
 	"crypto/hmac"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	. "github.com/infrago/base"
 	"github.com/infrago/infra"
+	"github.com/infrago/token/expire"
 )
 
 const (
 	PayloadToken  = "token"
 	PayloadStore  = "store"
 	PayloadHybrid = "hybrid"
+
+	defaultTokenVersion = 1
+)
+
+var (
+	ErrTokenInvalid          = errors.New("invalid token")
+	ErrTokenInvalidSign      = errors.New("invalid token sign")
+	ErrTokenNotActive        = errors.New("token not active")
+	ErrTokenExpired          = errors.New("token expired")
+	ErrTokenSignerMissing    = errors.New("token signer missing")
+	ErrTokenRevoked          = errors.New("token revoked")
+	ErrTokenIDRevoked        = errors.New("token id revoked")
+	ErrTokenIDMissing        = errors.New("token id missing")
+	ErrTokenPayloadMissing   = errors.New("token payload missing")
+	ErrTokenStoreUnavailable = errors.New("token store unavailable")
 )
 
 var module = &tokenModule{
@@ -133,15 +152,24 @@ func (m *tokenModule) Setup() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	m.signer = m.signers[strings.ToLower(m.config.Signer)]
-	m.driver = m.drivers[strings.ToLower(m.config.Driver)]
+	signerName := strings.ToLower(strings.TrimSpace(m.config.Signer))
+	if signerName == "" {
+		signerName = "default"
+	}
+	driverName := strings.ToLower(strings.TrimSpace(m.config.Driver))
+	if driverName == "" {
+		driverName = "default"
+	}
 
+	m.signer = m.signers[signerName]
+	m.driver = m.drivers[driverName]
 	if m.signer == nil {
-		m.signer = m.signers["default"]
+		panic("invalid token signer: " + signerName)
 	}
 	if m.driver == nil {
-		m.driver = m.drivers["default"]
+		panic("invalid token driver: " + driverName)
 	}
+
 	m.config.Payload = normalizePayloadMode(m.config.Payload)
 	m.config.IDLength = normalizeIDLength(m.config.IDLength)
 
@@ -164,7 +192,9 @@ func (m *tokenModule) Open() {
 	driver := m.driver
 	m.mutex.RUnlock()
 	if driver != nil {
-		_ = driver.Open()
+		if err := driver.Open(); err != nil {
+			panic("failed to open token driver: " + err.Error())
+		}
 	}
 }
 
@@ -185,31 +215,44 @@ func (m *tokenModule) Sign(req infra.Token) (string, error) {
 	signer := m.signer
 	driver := m.driver
 	payloadMode := m.config.Payload
+	idLength := m.config.IDLength
 	m.mutex.RUnlock()
 
 	if signer == nil {
-		return "", errors.New("token signer missing")
+		return "", ErrTokenSignerMissing
 	}
 
 	origPayload := req.Payload
 	signReq := req
 	if signReq.TokenID == "" {
-		signReq.TokenID = infra.GenerateTokenID(m.config.IDLength)
+		signReq.TokenID = infra.GenerateTokenID(idLength)
 	}
 	if payloadMode == PayloadStore {
 		signReq.Payload = Map{}
 	}
 
-	token, err := signer.Sign(signReq)
-	if err != nil {
-		return "", err
-	}
-
-	if driver != nil && (payloadMode == PayloadStore || payloadMode == PayloadHybrid) && signReq.TokenID != "" {
+	payloadStored := false
+	if payloadMode == PayloadStore || payloadMode == PayloadHybrid {
+		if driver == nil {
+			return "", fmt.Errorf("%w: token driver missing", ErrTokenStoreUnavailable)
+		}
 		if origPayload == nil {
 			origPayload = Map{}
 		}
-		_ = driver.SavePayload(signReq.TokenID, origPayload, signReq.Expires)
+		if err := driver.SavePayload(signReq.TokenID, origPayload, signReq.Expires); err != nil {
+			return "", fmt.Errorf("%w: save token payload: %w", ErrTokenStoreUnavailable, err)
+		}
+		payloadStored = true
+	}
+
+	token, err := signer.Sign(signReq)
+	if err != nil {
+		if payloadStored {
+			if cleanupErr := driver.DeletePayload(signReq.TokenID); cleanupErr != nil {
+				return "", errors.Join(err, fmt.Errorf("%w: cleanup token payload: %w", ErrTokenStoreUnavailable, cleanupErr))
+			}
+		}
+		return "", err
 	}
 	return token, nil
 }
@@ -222,7 +265,7 @@ func (m *tokenModule) Verify(token string) (infra.Token, error) {
 	m.mutex.RUnlock()
 
 	if signer == nil {
-		return infra.Token{}, errors.New("token signer missing")
+		return infra.Token{}, ErrTokenSignerMissing
 	}
 
 	session, err := signer.Verify(token)
@@ -231,20 +274,31 @@ func (m *tokenModule) Verify(token string) (infra.Token, error) {
 	}
 
 	if driver != nil {
-		if ok, _ := driver.RevokedToken(token); ok {
-			return infra.Token{}, errors.New("token revoked")
+		if ok, err := driver.RevokedToken(token); err != nil {
+			return infra.Token{}, fmt.Errorf("%w: check token revoke: %w", ErrTokenStoreUnavailable, err)
+		} else if ok {
+			return infra.Token{}, ErrTokenRevoked
 		}
-		if ok, _ := driver.RevokedTokenID(session.TokenID); ok {
-			return infra.Token{}, errors.New("token id revoked")
+		if ok, err := driver.RevokedTokenID(session.TokenID); err != nil {
+			return infra.Token{}, fmt.Errorf("%w: check token id revoke: %w", ErrTokenStoreUnavailable, err)
+		} else if ok {
+			return infra.Token{}, ErrTokenIDRevoked
 		}
 
+		if payloadMode == PayloadStore && session.TokenID == "" {
+			return infra.Token{}, ErrTokenIDMissing
+		}
 		if session.TokenID != "" && (payloadMode == PayloadStore || payloadMode == PayloadHybrid) {
-			if stored, ok, err := driver.LoadPayload(session.TokenID); err == nil && ok && stored != nil {
+			if stored, ok, err := driver.LoadPayload(session.TokenID); err != nil {
+				return infra.Token{}, fmt.Errorf("%w: load token payload: %w", ErrTokenStoreUnavailable, err)
+			} else if ok && stored != nil {
 				if payloadMode == PayloadStore {
 					session.Payload = stored
 				} else {
 					session.Payload = mergePayload(session.Payload, stored)
 				}
+			} else if payloadMode == PayloadStore {
+				return infra.Token{}, ErrTokenPayloadMissing
 			}
 		}
 	}
@@ -327,13 +381,22 @@ type defaultSigner struct {
 }
 
 type defaultHeader struct {
-	ID    string `json:"i,omitempty"`
-	Begin int64  `json:"b,omitempty"`
-	End   int64  `json:"e,omitempty"`
-	Auth  bool   `json:"a,omitempty"`
+	Version int    `json:"v,omitempty"`
+	ID      string `json:"i,omitempty"`
+	Begin   int64  `json:"b,omitempty"`
+	End     int64  `json:"e,omitempty"`
+	Auth    bool   `json:"a,omitempty"`
 }
 
 func (d *defaultSigner) Configure(setting Map) {
+	if v, ok := setting["token_codec"].(string); ok && strings.TrimSpace(v) != "" {
+		d.codec = strings.TrimSpace(v)
+		return
+	}
+	if v, ok := setting["signer_codec"].(string); ok && strings.TrimSpace(v) != "" {
+		d.codec = strings.TrimSpace(v)
+		return
+	}
 	if v, ok := setting["codec"].(string); ok && strings.TrimSpace(v) != "" {
 		d.codec = strings.TrimSpace(v)
 	}
@@ -353,7 +416,7 @@ func (d *defaultSigner) Sign(req infra.Token) (string, error) {
 		tokenID = infra.GenerateTokenID(d.idLength)
 	}
 
-	header := defaultHeader{ID: tokenID, Begin: req.Begin, End: req.Expires, Auth: req.Auth}
+	header := defaultHeader{Version: defaultTokenVersion, ID: tokenID, Begin: req.Begin, End: req.Expires, Auth: req.Auth}
 
 	payload := req.Payload
 	if payload == nil {
@@ -389,11 +452,11 @@ func (d *defaultSigner) Verify(token string) (infra.Token, error) {
 	token = strings.TrimSpace(token)
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return infra.Token{}, errors.New("invalid token")
+		return infra.Token{}, ErrTokenInvalid
 	}
 	unsigned := parts[0] + "." + parts[1]
 	if !defaultVerify(unsigned, parts[2], d.secret) {
-		return infra.Token{}, errors.New("invalid token sign")
+		return infra.Token{}, ErrTokenInvalidSign
 	}
 
 	hb, err := base64.RawURLEncoding.DecodeString(parts[0])
@@ -409,12 +472,15 @@ func (d *defaultSigner) Verify(token string) (infra.Token, error) {
 	if err := json.Unmarshal(hb, &head); err != nil {
 		return infra.Token{}, err
 	}
+	if head.Version < 0 || head.Version > defaultTokenVersion {
+		return infra.Token{}, ErrTokenInvalid
+	}
 	now := time.Now().Unix()
 	if head.Begin > 0 && now < head.Begin {
-		return infra.Token{}, errors.New("token not active")
+		return infra.Token{}, ErrTokenNotActive
 	}
 	if head.End > 0 && now > head.End {
-		return infra.Token{}, errors.New("token expired")
+		return infra.Token{}, ErrTokenExpired
 	}
 
 	payload := Map{}
@@ -487,7 +553,7 @@ func (d *defaultDriver) LoadPayload(tokenID string) (Map, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
-	if item.exp > 0 && time.Now().Unix() > item.exp {
+	if expire.ExpiredUnix(item.exp) {
 		delete(d.payloads, tokenID)
 		return nil, false, nil
 	}
@@ -512,7 +578,7 @@ func (d *defaultDriver) RevokeToken(token string, exp int64) error {
 	}
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
-	d.tokens[token] = exp
+	d.tokens[hashTokenKey(token)] = exp
 	return nil
 }
 
@@ -534,12 +600,13 @@ func (d *defaultDriver) RevokedToken(token string) (bool, error) {
 	}
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
-	exp, ok := d.tokens[token]
+	key := hashTokenKey(token)
+	exp, ok := d.tokens[key]
 	if !ok {
 		return false, nil
 	}
-	if exp > 0 && time.Now().Unix() > exp {
-		delete(d.tokens, token)
+	if expire.ExpiredUnix(exp) {
+		delete(d.tokens, key)
 		return false, nil
 	}
 	return true, nil
@@ -556,7 +623,7 @@ func (d *defaultDriver) RevokedTokenID(tokenID string) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	if exp > 0 && time.Now().Unix() > exp {
+	if expire.ExpiredUnix(exp) {
 		delete(d.tokenIDs, tokenID)
 		return false, nil
 	}
@@ -574,7 +641,7 @@ func defaultSign(data, secret string) (string, error) {
 	if _, err := h.Write([]byte(data)); err != nil {
 		return "", err
 	}
-	return base64.URLEncoding.EncodeToString(h.Sum(nil)), nil
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil)), nil
 }
 
 func defaultVerify(data, sign, secret string) bool {
@@ -591,6 +658,11 @@ func defaultVerify(data, sign, secret string) bool {
 	h := hmac.New(sha256.New, []byte(secret))
 	_, _ = h.Write([]byte(data))
 	return hmac.Equal(sig, h.Sum(nil))
+}
+
+func hashTokenKey(token string) string {
+	sum := sha1.Sum([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 func defaultSecret() string {
